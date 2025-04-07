@@ -1,0 +1,221 @@
+# ====================================================================
+# = ESPHome Config for Arcam SA10/SA20 (Lambda/Include Approach)   =
+# ====================================================================
+
+esphome:
+  name: arcam_sa20_controller # Use a valid hostname
+  platform: ESP32 # Or ESP8266
+  board: nodemcu-32s # Or your specific board
+  # --- Include the C++ helper functions ---
+  includes:
+    - include/ArcamSA20Protocol.h # Point to the new header file
+
+# Enable Logging, API, OTA, WiFi (as before)
+logger:
+api:
+ota:
+wifi:
+  ssid: "Your_WiFi_SSID" #<-- UPDATE
+  password: "Your_WiFi_Password" #<-- UPDATE
+  power_save_mode: none
+
+# --- Define Global Variables to hold state ---
+globals:
+  - id: arcam_is_powered_on
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: arcam_volume_level # Now represents 0-99
+    type: int
+    restore_value: no
+    initial_value: '20' # Sensible default?
+  - id: arcam_is_muted
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: arcam_source_name
+    type: std::string
+    restore_value: no
+    initial_value: '"Unknown"'
+
+# --- Define the UART Component ---
+uart:
+  id: uart_arcam
+  # --- UPDATE PINS ---
+  tx_pin: GPIO17 # <-- UPDATE
+  rx_pin: GPIO16 # <-- UPDATE
+  # --- CRITICAL: UPDATE BAUD RATE ---
+  baud_rate: 38400
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 256 # Default is usually fine
+
+  # --- on_data trigger (structure is correct) ---
+  on_data:
+    delimiter: [0x0D] # Arcam ETR byte
+    then:
+      - lambda: |-
+          ESP_LOGD("on_uart_data", "SA20 Received %d bytes", x.size());
+          // Use the new parser function from the updated header
+          bool changed = parse_arcam_sa_response(
+                              x,
+                              id(arcam_is_powered_on),
+                              id(arcam_volume_level),
+                              id(arcam_is_muted),
+                              id(arcam_source_name)
+                          );
+          if (changed) {
+            ESP_LOGD("on_uart_data", "SA20 State changed, publishing updates.");
+            id(arcam_is_powered_on).publish_state(id(arcam_is_powered_on).state);
+            id(arcam_volume_level).publish_state(id(arcam_volume_level).state);
+            id(arcam_is_muted).publish_state(id(arcam_is_muted).state);
+            id(arcam_source_name).publish_state(id(arcam_source_name).state);
+          }
+
+# --- Polling Setup ---
+interval:
+  - interval: 15s # Keep polling interval
+    then:
+      - script.execute: poll_arcam_sa_status # Use new script ID
+
+script:
+  - id: poll_arcam_sa_status # New ID
+    mode: single
+    then:
+      - logger.log: "Executing Arcam SA status poll script..."
+      # Use new constants/helpers for polling SA20 status
+      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_POWER, {ARCAM_SA_DATA_QUERY}); # Query Power (Cmd 0x00, Data 0xF0)
+      - delay: 250ms
+      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_SOURCE_SET, {ARCAM_SA_DATA_QUERY}); # Query Source (Cmd 0x1D, Data 0xF0)
+      - delay: 250ms
+      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_VOLUME, {ARCAM_SA_DATA_QUERY}); # Query Volume (Cmd 0x0D, Data 0xF0)
+      - delay: 250ms
+      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_MUTE, {ARCAM_SA_DATA_QUERY}); # Query Mute (Cmd 0x0E, Data 0xF0)
+
+# --- Template Entities for Home Assistant ---
+
+# Power Switch (using direct commands)
+switch:
+  - platform: template
+    name: "Arcam SA Power" # Renamed slightly
+    id: arcam_sa_power_switch
+    lambda: |-
+      return id(arcam_is_powered_on).state;
+    turn_on_action:
+      - logger.log: "Turning Arcam SA ON"
+      # Send direct Power ON command
+      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_POWER, {ARCAM_SA_DATA_POWER_ON});
+      # Optimistic update
+      - lambda: |-
+          id(arcam_is_powered_on) = true;
+          id(arcam_is_powered_on).publish_state(true);
+    turn_off_action:
+      - logger.log: "Turning Arcam SA OFF (Standby)"
+      # Send direct Power OFF command
+      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_POWER, {ARCAM_SA_DATA_POWER_OFF});
+      # Optimistic update
+      - lambda: |-
+          id(arcam_is_powered_on) = false;
+          id(arcam_is_powered_on).publish_state(false);
+
+# Mute Switch (using direct commands)
+  - platform: template
+    name: "Arcam SA Mute" # Renamed slightly
+    id: arcam_sa_mute_switch
+    lambda: |-
+      return id(arcam_is_muted).state;
+    turn_on_action: # Turn ON mute (Send MUTE command = 0x00)
+      - logger.log: "Muting Arcam SA"
+      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_MUTE, {ARCAM_SA_DATA_MUTE_ON});
+      - lambda: |-
+          id(arcam_is_muted) = true;
+          id(arcam_is_muted).publish_state(true);
+    turn_off_action: # Turn OFF mute (Send UNMUTE command = 0x01)
+      - logger.log: "Unmuting Arcam SA"
+      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_MUTE, {ARCAM_SA_DATA_MUTE_OFF});
+      - lambda: |-
+          id(arcam_is_muted) = false;
+          id(arcam_is_muted).publish_state(false);
+
+# Volume Control (using Number entity)
+number:
+  - platform: template
+    name: "Arcam SA Volume" # Renamed slightly
+    id: arcam_sa_volume_number
+    lambda: |-
+      return id(arcam_volume_level).state;
+    # Updated range for SA20
+    min_value: 0
+    max_value: 99
+    step: 1
+    set_action:
+      - logger.log:
+          format: "Setting Arcam SA volume to %d"
+          args: ["(int)x"]
+      # Send direct Volume SET command (0x0D)
+      - lambda: !lambda |-
+          int volume_sa = (int)x;
+          if (volume_sa < 0) volume_sa = 0;
+          if (volume_sa > 99) volume_sa = 99; // Use SA20 max volume
+          send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_VOLUME, {(uint8_t)volume_sa});
+      - lambda: |- # Optimistic update
+          id(arcam_volume_level) = (int)x;
+          id(arcam_volume_level).publish_state((int)x);
+
+# Source Selection (using direct commands)
+select:
+  - platform: template
+    name: "Arcam SA Source" # Renamed slightly
+    id: arcam_sa_source_select
+    lambda: |-
+      return id(arcam_source_name).state;
+    # Updated options for SA20
+    options:
+      - "Phono"
+      - "Aux"
+      - "PVR"
+      - "AV"
+      - "STB"
+      - "CD"
+      - "BD"
+      - "SAT"
+    set_action:
+      - logger.log:
+          format: "Setting Arcam SA source to %s"
+          args: ["x.c_str()"]
+      # Send direct Source SET command (0x1D)
+      - lambda: !lambda |-
+          std::string requested_source = x;
+          uint8_t source_code = 0xFF; // Invalid default
+
+          // Map source name to SA20 source code
+          if (requested_source == "Phono") source_code = ARCAM_SA_SOURCE_PHONO; // 0x01
+          else if (requested_source == "Aux") source_code = ARCAM_SA_SOURCE_AUX;   // 0x02
+          else if (requested_source == "PVR") source_code = ARCAM_SA_SOURCE_PVR;   // 0x03
+          else if (requested_source == "AV") source_code = ARCAM_SA_SOURCE_AV;     // 0x04
+          else if (requested_source == "STB") source_code = ARCAM_SA_SOURCE_STB;   // 0x05
+          else if (requested_source == "CD") source_code = ARCAM_SA_SOURCE_CD;     // 0x06
+          else if (requested_source == "BD") source_code = ARCAM_SA_SOURCE_BD;     // 0x07
+          else if (requested_source == "SAT") source_code = ARCAM_SA_SOURCE_SAT;   // 0x08
+
+          if (source_code != 0xFF) {
+            ESP_LOGD("set_source_sa", "Sending source code 0x%02X for '%s'", source_code, requested_source.c_str());
+            send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_SOURCE_SET, {source_code});
+
+            // Optimistic Update
+            ESP_LOGD("set_source_sa", "Optimistically setting source global to '%s'", requested_source.c_str());
+            id(arcam_source_name) = requested_source;
+            id(arcam_source_name).publish_state(requested_source);
+          } else {
+            ESP_LOGW("set_source_sa", "Source '%s' not mapped. No command sent.", requested_source.c_str());
+          }
+
+# Optional: Text sensor to display the source name
+text_sensor:
+  - platform: template
+    name: "Arcam SA Current Source Display" # Renamed slightly
+    id: arcam_sa_current_source_display
+    lambda: |-
+      return id(arcam_source_name).state;
+    update_interval: 15s # Update periodically based on global changes
