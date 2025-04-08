@@ -1,221 +1,451 @@
-# ====================================================================
-# = ESPHome Config for Arcam SA10/SA20 (Lambda/Include Approach)   =
-# ====================================================================
-
+#*******************************************************************************
+# ESPHome Configuration for Arcam SA10/SA20 RS232 Control
+# Target Board: ESP32-S2 Mini (or similar ESP32)
+# Target Amp: Arcam SA10 or SA20
+# Based on Arcam Document: SH277E Issue B
+# Final Working Version
+#*******************************************************************************
 esphome:
-  name: arcam_sa20_controller # Use a valid hostname
-  platform: ESP32 # Or ESP8266
-  board: nodemcu-32s # Or your specific board
-  # --- Include the C++ helper functions ---
-  includes:
-    - include/ArcamSA20Protocol.h # Point to the new header file
+  name: arcam_sa20_ctrl # Hostname for the ESP device
+  platform: ESP32
+  board: esp32s2mini # Verify this matches your specific ESP32 board
 
-# Enable Logging, API, OTA, WiFi (as before)
+  # --- Actions on Boot ---
+  # Query essential states after boot to sync Home Assistant
+  on_boot:
+    priority: -10 # Run after network connection is likely established
+    then:
+      - delay: 5s # Allow time for amplifier and network to initialize
+      - lambda: ESP_LOGI("main", "Querying initial Arcam SA state...");
+      # Execute script to send query commands for essential states
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x00, 0xF0};' # Query Power (CC=0x00, Data=0xF0)
+      - delay: 250ms # Stagger queries slightly
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x0D, 0xF0};' # Query Volume (CC=0x0D, Data=0xF0)
+      - delay: 250ms
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x0E, 0xF0};' # Query Mute (CC=0x0E, Data=0xF0)
+      - delay: 250ms
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x1D, 0xF0};' # Query Source (CC=0x1D, Data=0xF0)
+      - delay: 250ms
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x3B, 0xF0};' # Query Balance (CC=0x3B, Data=0xF0)
+
+#-------------------------------------------------------------------------------
+# Core ESPHome Components
+#-------------------------------------------------------------------------------
 logger:
+  level: INFO   # Set to INFO for normal operation, DEBUG for troubleshooting
+  baud_rate: 0 # Use USB CDC for logging (no hardware UART logging)
+
 api:
+  encryption:
+    key: "YOUR_API_ENCRYPTION_KEY" # Replace with your Home Assistant API encryption key
+
 ota:
+  password: "YOUR_OTA_PASSWORD" # Replace with your Over-The-Air update password
+
 wifi:
-  ssid: "Your_WiFi_SSID" #<-- UPDATE
-  password: "Your_WiFi_Password" #<-- UPDATE
-  power_save_mode: none
+  ssid: "YOUR_WIFI_SSID" # Replace with your WiFi network name
+  password: "YOUR_WIFI_PASSWORD" # Replace with your WiFi password
+  # Optional Fallback AP if WiFi connection fails
+  ap:
+    ssid: "Arcam SA Controller Fallback"
+    password: "fallbackpassword"
 
-# --- Define Global Variables to hold state ---
-globals:
-  - id: arcam_is_powered_on
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: arcam_volume_level # Now represents 0-99
-    type: int
-    restore_value: no
-    initial_value: '20' # Sensible default?
-  - id: arcam_is_muted
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: arcam_source_name
-    type: std::string
-    restore_value: no
-    initial_value: '"Unknown"'
+web_server:
+  port: 80 # Enable web server for diagnostics/updates if needed
 
-# --- Define the UART Component ---
+#-------------------------------------------------------------------------------
+# Hardware Configuration - UART for RS232 Communication
+#-------------------------------------------------------------------------------
+substitutions:
+  uart_tx_pin: "GPIO1" # CHANGE TO YOUR ACTUAL ESP32 TX PIN connected to MAX3232 DIN
+  uart_rx_pin: "GPIO2" # CHANGE TO YOUR ACTUAL ESP32 RX PIN connected to MAX3232 ROUT
+
 uart:
-  id: uart_arcam
-  # --- UPDATE PINS ---
-  tx_pin: GPIO17 # <-- UPDATE
-  rx_pin: GPIO16 # <-- UPDATE
-  # --- CRITICAL: UPDATE BAUD RATE ---
-  baud_rate: 38400
+  id: arcam_uart
+  tx_pin: ${uart_tx_pin}
+  rx_pin: ${uart_rx_pin}
+  baud_rate: 38400 # Baud rate for Arcam SA10/SA20
   data_bits: 8
   parity: NONE
   stop_bits: 1
-  rx_buffer_size: 256 # Default is usually fine
+  rx_buffer_size: 256 # Buffer for incoming serial data
 
-  # --- on_data trigger (structure is correct) ---
-  on_data:
-    delimiter: [0x0D] # Arcam ETR byte
+#-------------------------------------------------------------------------------
+# Global State Variables - To hold the amplifier's known state
+#-------------------------------------------------------------------------------
+globals:
+  - id: g_power_state
+    type: bool
+    restore_value: no # Get state from amp on boot, not flash
+    initial_value: 'false'
+  - id: g_volume # Range 0-99 for SA series
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_mute_state
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_current_source # Stores SA series source codes (e.g., 0x06=CD)
+    type: int
+    restore_value: no
+    initial_value: '0x00' # Use 0 for unknown/uninitialized
+  - id: g_balance # Stores SA series balance codes (L12(0x8C)-R12(0x0C), 0x00=Centre)
+    type: int
+    restore_value: no
+    initial_value: '0x00' # Default to Centre
+
+#-------------------------------------------------------------------------------
+# Script for Sending Formatted Arcam Commands
+#-------------------------------------------------------------------------------
+script:
+  - id: send_arcam_command
+    mode: queued # Process commands sequentially if triggered rapidly
+    parameters:
+      command_data: std::vector<uint8_t> # Expects a vector containing {CC, Optional Data...}
     then:
       - lambda: |-
-          ESP_LOGD("on_uart_data", "SA20 Received %d bytes", x.size());
-          // Use the new parser function from the updated header
-          bool changed = parse_arcam_sa_response(
-                              x,
-                              id(arcam_is_powered_on),
-                              id(arcam_volume_level),
-                              id(arcam_is_muted),
-                              id(arcam_source_name)
-                          );
-          if (changed) {
-            ESP_LOGD("on_uart_data", "SA20 State changed, publishing updates.");
-            id(arcam_is_powered_on).publish_state(id(arcam_is_powered_on).state);
-            id(arcam_volume_level).publish_state(id(arcam_volume_level).state);
-            id(arcam_is_muted).publish_state(id(arcam_is_muted).state);
-            id(arcam_source_name).publish_state(id(arcam_source_name).state);
+          #include <vector>
+          #include <string>
+          // Ensure standard libraries are available in lambda scope
+
+          if (command_data.empty()) {
+            ESP_LOGE("arcam_tx", "Send script called with empty data!");
+            return;
           }
 
-# --- Polling Setup ---
+          // Construct SA command format: <St=0x21> <Zn=0x01> <Cc> <Dl> <Data...> <Et=0x0D>
+          uint8_t cc = command_data[0]; // First element is Command Code
+          std::vector<uint8_t> data_payload;
+          if (command_data.size() > 1) { // Remaining elements are Data payload
+            data_payload.assign(command_data.begin() + 1, command_data.end());
+          }
+          uint8_t dl = data_payload.size(); // Data Length (Dl) byte
+
+          std::vector<uint8_t> command_bytes;
+          command_bytes.push_back(0x21); // Start byte
+          command_bytes.push_back(0x01); // Zone 1
+          command_bytes.push_back(cc);   // Command Code
+          command_bytes.push_back(dl);   // Data Length
+          command_bytes.insert(command_bytes.end(), data_payload.begin(), data_payload.end()); // Append Data payload
+          command_bytes.push_back(0x0D); // End byte
+
+          // Log the bytes being sent (VERBOSE level for debugging)
+          std::string bytes_to_send_str;
+          char hex_byte[4];
+          for(uint8_t b : command_bytes) { sprintf(hex_byte, "%02X ", b); bytes_to_send_str += hex_byte; }
+          ESP_LOGV("arcam_tx", "Sending %d bytes: %s", command_bytes.size(), bytes_to_send_str.c_str());
+
+          // Send the command over UART
+          id(arcam_uart).write_array(command_bytes.data(), command_bytes.size());
+
+#-------------------------------------------------------------------------------
+# Interval Timer for Receiving and Parsing Arcam Responses/Updates
+#-------------------------------------------------------------------------------
 interval:
-  - interval: 15s # Keep polling interval
+  - interval: 150ms # Check for incoming data fairly frequently
     then:
-      - script.execute: poll_arcam_sa_status # Use new script ID
+      - lambda: |-
+          #include <vector>
+          #include <string>
+          #include <cstdlib>
 
-script:
-  - id: poll_arcam_sa_status # New ID
-    mode: single
-    then:
-      - logger.log: "Executing Arcam SA status poll script..."
-      # Use new constants/helpers for polling SA20 status
-      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_POWER, {ARCAM_SA_DATA_QUERY}); # Query Power (Cmd 0x00, Data 0xF0)
-      - delay: 250ms
-      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_SOURCE_SET, {ARCAM_SA_DATA_QUERY}); # Query Source (Cmd 0x1D, Data 0xF0)
-      - delay: 250ms
-      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_VOLUME, {ARCAM_SA_DATA_QUERY}); # Query Volume (Cmd 0x0D, Data 0xF0)
-      - delay: 250ms
-      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_MUTE, {ARCAM_SA_DATA_QUERY}); # Query Mute (Cmd 0x0E, Data 0xF0)
+          // --- Helper Function: Convert SA Source Hex Code to Name ---
+          auto get_sa_source_name_from_hex = [](int source_hex) -> std::string {
+              switch (source_hex) {
+                  case 0x01: return "PHONO"; case 0x02: return "AUX"; case 0x03: return "PVR";
+                  case 0x04: return "AV";    case 0x05: return "STB"; case 0x06: return "CD";
+                  case 0x07: return "BD";    case 0x08: return "SAT";
+                  default:   return "Unknown"; // Handles unmapped codes
+              }
+          };
+          // --- End Helper ---
 
-# --- Template Entities for Home Assistant ---
+          // Protocol constants
+          const uint8_t STR = 0x21;
+          const uint8_t ETR = 0x0D;
+          const uint8_t ZONE = 0x01;
+          // Static buffer persists across calls to this lambda
+          static std::vector<uint8_t> rx_buffer;
+          const size_t MAX_FRAME_LEN = 260; // Max Arcam data len=255 + overhead
+          const size_t MIN_FRAME_LEN = 7;   // Minimum valid Arcam response length (<St><Zn><Cc><Ac><Dl=0><Et>)
 
-# Power Switch (using direct commands)
+          // Process all available bytes in the UART buffer
+          while (id(arcam_uart).available() > 0) {
+            uint8_t byte;
+            if (!id(arcam_uart).read_byte(&byte)) continue; // Skip if read error
+            ESP_LOGV("arcam_rx", "Byte received: 0x%02X", byte);
+
+            // Handle empty buffer: only start accumulating if STR arrives
+            if (rx_buffer.empty()) {
+                if (byte == STR) { rx_buffer.push_back(byte); }
+                continue; // Get next byte
+            }
+
+            // Add byte to buffer if not empty and space allows
+            if (rx_buffer.size() < MAX_FRAME_LEN) {
+                rx_buffer.push_back(byte);
+            } else {
+                // Buffer full: Log overflow, clear buffer, restart if current byte is STR
+                ESP_LOGW("arcam_rx", "Buffer overflow (>%d). Clearing. Last byte: 0x%02X", MAX_FRAME_LEN, byte);
+                // Log buffer content before clearing (optional, can be noisy)
+                // std::string overflow_buffer_str; char hex_byte_ovfl[4];
+                // for(uint8_t b_ovfl : rx_buffer) { sprintf(hex_byte_ovfl, "%02X ", b_ovfl); overflow_buffer_str += hex_byte_ovfl; }
+                // ESP_LOGW("arcam_rx", "Overflow Buffer: %s", overflow_buffer_str.c_str());
+                rx_buffer.clear();
+                if (byte == STR) { rx_buffer.push_back(byte); }
+                continue; // Get next byte
+            }
+
+            // --- Frame Validation and Processing ---
+            // Check if the buffer *now* potentially represents a complete, valid frame
+            // Criteria: Min length, Starts STR, Ends ETR, Zone OK, Length matches internal DL byte
+            bool potential_frame = false;
+            if (rx_buffer.size() >= MIN_FRAME_LEN &&
+                rx_buffer[0] == STR &&
+                rx_buffer.back() == ETR && // Check the *last* byte added
+                rx_buffer[1] == ZONE)
+            {
+                // Basic structure seems OK, check internal data length byte
+                uint8_t dl = rx_buffer[4]; // Data Length byte at index 4
+                size_t expected_len = 5 + dl + 1; // St(1)+Zn(1)+Cc(1)+Ac(1)+Dl(1) + Data(dl) + Et(1)
+
+                // Does the actual buffer size match the size expected from the DL byte?
+                if (rx_buffer.size() == expected_len) {
+                    potential_frame = true; // All checks passed!
+                }
+                 // Optional: Log if frame markers look ok but DL causes length mismatch
+                 // else { ESP_LOGV("arcam_rx", "Frame markers OK, but length mismatch (Got %d, Expected %d based on DL=0x%02X)", rx_buffer.size(), expected_len, dl); }
+            }
+
+            // Process only if potential_frame flag is true
+            if (potential_frame) {
+                // Log the validated frame buffer
+                std::string received_buffer_str; char hex_byte_rec[4];
+                for(uint8_t b_rec : rx_buffer) { sprintf(hex_byte_rec, "%02X ", b_rec); received_buffer_str += hex_byte_rec; }
+                ESP_LOGD("arcam_rx", "Valid Frame Received (%d bytes): %s", rx_buffer.size(), received_buffer_str.c_str());
+
+                // Extract fields from the validated frame
+                uint8_t cc = rx_buffer[2]; uint8_t ac = rx_buffer[3]; uint8_t dl = rx_buffer[4];
+                std::vector<uint8_t> data(rx_buffer.begin() + 5, rx_buffer.begin() + 5 + dl);
+
+                // Process based on Answer Code (Ac)
+                if (ac == 0x00) { // Status Update or OK reply containing status
+                    // Process based on Command Code (Cc)
+                    switch (cc) {
+                        case 0x00: // Power Status
+                            if(dl==1 && !data.empty()){bool ns=(data[0]==0x01); if(id(g_power_state)!=ns){id(g_power_state)=ns; id(power_switch).publish_state(ns); ESP_LOGI("arcam_rx","Power: %s",ns?"ON":"OFF");}}
+                            break;
+                        case 0x0D: // Volume Status
+                            if(dl==1 && !data.empty()){if(id(g_volume)!=data[0]){id(g_volume)=data[0]; id(volume_number).publish_state(id(g_volume)); ESP_LOGI("arcam_rx","Volume: %d",id(g_volume));}}
+                            break;
+                        case 0x0E: // Mute Status (Response Data: 00=Muted, 01=Unmuted)
+                            if(dl==1 && !data.empty()){bool new_mute_state=(data[0]==0x00); if(id(g_mute_state)!=new_mute_state){id(g_mute_state)=new_mute_state; id(mute_switch).publish_state(new_mute_state); ESP_LOGI("arcam_rx","Mute: %s",new_mute_state?"ON":"OFF");}}
+                            break;
+                        case 0x1D: // Source Status (Assuming DL=1, needs verification if processor mode used)
+                            if(dl==1 && !data.empty()){int rs=data[0]; if(id(g_current_source)!=rs){id(g_current_source)=rs; std::string n=get_sa_source_name_from_hex(id(g_current_source)); id(source_select).publish_state(n); ESP_LOGI("arcam_rx","Source: %s (0x%02X)",n.c_str(),id(g_current_source));}}
+                            break;
+                        case 0x3B: // Balance Status (Data: 0x00=Centre, 0x01-0C=Right, 0x81-8C=Left)
+                            if(dl==1 && !data.empty()){if(id(g_balance)!=data[0]){id(g_balance)=data[0]; int bd=0; if(id(g_balance)==0x00)bd=0; else if(id(g_balance)>=0x01&&id(g_balance)<=0x0C)bd=id(g_balance); else if(id(g_balance)>=0x81&&id(g_balance)<=0x8C)bd=-(id(g_balance)-0x80); id(balance_number).publish_state(bd); ESP_LOGI("arcam_rx","Balance: %d (0x%02X)",bd,id(g_balance));}}
+                            break;
+                        // Add cases for other CCs you might want to monitor (e.g., 0x01 Display Brightness)
+                    }
+                } else if (ac >= 0x82) { // Handle Arcam Error Codes
+                    ESP_LOGW("arcam_rx", "Received Arcam Error Reply: CC=0x%02X, AC=0x%02X", cc, ac);
+                }
+                // --- End Frame Processing ---
+
+                // Clear buffer AFTER processing the valid frame
+                rx_buffer.clear();
+            }
+            // If potential_frame was false, loop continues to get the next byte
+          } // end while (uart.available)
+
+#-------------------------------------------------------------------------------
+# Control Components (Switch, Number, Select, Button) for Home Assistant
+#-------------------------------------------------------------------------------
+
 switch:
   - platform: template
-    name: "Arcam SA Power" # Renamed slightly
-    id: arcam_sa_power_switch
+    id: power_switch
+    name: "Arcam SA Power"
+    icon: "mdi:power"
     lambda: |-
-      return id(arcam_is_powered_on).state;
+      return id(g_power_state);
     turn_on_action:
-      - logger.log: "Turning Arcam SA ON"
-      # Send direct Power ON command
-      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_POWER, {ARCAM_SA_DATA_POWER_ON});
-      # Optimistic update
-      - lambda: |-
-          id(arcam_is_powered_on) = true;
-          id(arcam_is_powered_on).publish_state(true);
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x00, 0x01};' # Power On Command
+      - lambda: |- # Optimistic update
+          if (!id(g_power_state)) { id(g_power_state) = true; id(power_switch).publish_state(true); }
     turn_off_action:
-      - logger.log: "Turning Arcam SA OFF (Standby)"
-      # Send direct Power OFF command
-      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_POWER, {ARCAM_SA_DATA_POWER_OFF});
-      # Optimistic update
-      - lambda: |-
-          id(arcam_is_powered_on) = false;
-          id(arcam_is_powered_on).publish_state(false);
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x00, 0x00};' # Power Off Command
+      - lambda: |- # Optimistic update
+          if (id(g_power_state)) { id(g_power_state) = false; id(power_switch).publish_state(false); }
 
-# Mute Switch (using direct commands)
   - platform: template
-    name: "Arcam SA Mute" # Renamed slightly
-    id: arcam_sa_mute_switch
+    id: mute_switch
+    name: "Arcam SA Mute"
+    icon: "mdi:volume-mute"
     lambda: |-
-      return id(arcam_is_muted).state;
-    turn_on_action: # Turn ON mute (Send MUTE command = 0x00)
-      - logger.log: "Muting Arcam SA"
-      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_MUTE, {ARCAM_SA_DATA_MUTE_ON});
+      return id(g_mute_state);
+    turn_on_action: # Turn Mute ON
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x0E, 0x00};' # Mute Command
       - lambda: |-
-          id(arcam_is_muted) = true;
-          id(arcam_is_muted).publish_state(true);
-    turn_off_action: # Turn OFF mute (Send UNMUTE command = 0x01)
-      - logger.log: "Unmuting Arcam SA"
-      - lambda: send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_MUTE, {ARCAM_SA_DATA_MUTE_OFF});
+          if (!id(g_mute_state)) { id(g_mute_state) = true; id(mute_switch).publish_state(true); }
+    turn_off_action: # Turn Mute OFF
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x0E, 0x01};' # Unmute Command
       - lambda: |-
-          id(arcam_is_muted) = false;
-          id(arcam_is_muted).publish_state(false);
+          if (id(g_mute_state)) { id(g_mute_state) = false; id(mute_switch).publish_state(false); }
 
-# Volume Control (using Number entity)
 number:
   - platform: template
-    name: "Arcam SA Volume" # Renamed slightly
-    id: arcam_sa_volume_number
+    id: volume_number
+    name: "Arcam SA Volume"
+    icon: "mdi:volume-high"
     lambda: |-
-      return id(arcam_volume_level).state;
-    # Updated range for SA20
+      return (float)id(g_volume);
     min_value: 0
-    max_value: 99
+    max_value: 99 # SA Volume Range
     step: 1
     set_action:
-      - logger.log:
-          format: "Setting Arcam SA volume to %d"
-          args: ["(int)x"]
-      # Send direct Volume SET command (0x0D)
-      - lambda: !lambda |-
-          int volume_sa = (int)x;
-          if (volume_sa < 0) volume_sa = 0;
-          if (volume_sa > 99) volume_sa = 99; // Use SA20 max volume
-          send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_VOLUME, {(uint8_t)volume_sa});
-      - lambda: |- # Optimistic update
-          id(arcam_volume_level) = (int)x;
-          id(arcam_volume_level).publish_state((int)x);
+      - lambda: |-
+          int volume_level = (int)x;
+          if (volume_level < 0) volume_level = 0;
+          if (volume_level > 99) volume_level = 99;
+          id(g_volume) = volume_level; // Update global optimistically
+          ESP_LOGD("set_action", "Volume set to %d, prep script.", volume_level);
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x0D, (uint8_t)id(g_volume)};' # Volume Command
 
-# Source Selection (using direct commands)
+  - platform: template
+    id: balance_number
+    name: "Arcam SA Balance"
+    icon: "mdi:scale-balance"
+    lambda: |-
+      // Convert stored hex (0x00, 0x01-0x0C=R, 0x81-0x8C=L) to display (-12..0..+12)
+      int balance_hex = id(g_balance);
+      int balance_display = 0;
+      if(balance_hex == 0x00) balance_display = 0;
+      else if (balance_hex >= 0x01 && balance_hex <= 0x0C) balance_display = balance_hex;
+      else if (balance_hex >= 0x81 && balance_hex <= 0x8C) balance_display = -(balance_hex - 0x80);
+      return (float)balance_display;
+    min_value: -12 # SA Balance Range Left
+    max_value: 12  # SA Balance Range Right
+    step: 1
+    set_action:
+      - lambda: |-
+          int balance_val = (int)x; // User input (-12 to +12)
+          if (balance_val < -12) balance_val = -12;
+          if (balance_val > 12) balance_val = 12;
+          uint8_t balance_hex = 0x00; // Default Centre
+          if (balance_val > 0) balance_hex = balance_val;           // R+1..+12 -> 0x01..0x0C
+          else if (balance_val < 0) balance_hex = 0x80 + abs(balance_val); // L-1..-12 -> 0x81..0x8C
+          id(g_balance) = balance_hex; // Update global optimistically
+          ESP_LOGD("set_action", "Balance set to %d (0x%02X), prep script.", balance_val, balance_hex);
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x3B, (uint8_t)id(g_balance)};' # Balance Command
+
 select:
   - platform: template
-    name: "Arcam SA Source" # Renamed slightly
-    id: arcam_sa_source_select
+    id: source_select
+    name: "Arcam SA Source"
+    icon: "mdi:import"
+    # optimistic: true # Recommend optimistic for selects involving direct commands
+    options: # SA Inputs
+      - PHONO
+      - AUX
+      - PVR
+      - AV
+      - STB
+      - CD
+      - BD
+      - SAT
+      - Unknown # Fallback
     lambda: |-
-      return id(arcam_source_name).state;
-    # Updated options for SA20
-    options:
-      - "Phono"
-      - "Aux"
-      - "PVR"
-      - "AV"
-      - "STB"
-      - "CD"
-      - "BD"
-      - "SAT"
-    set_action:
-      - logger.log:
-          format: "Setting Arcam SA source to %s"
-          args: ["x.c_str()"]
-      # Send direct Source SET command (0x1D)
-      - lambda: !lambda |-
-          std::string requested_source = x;
-          uint8_t source_code = 0xFF; // Invalid default
-
-          // Map source name to SA20 source code
-          if (requested_source == "Phono") source_code = ARCAM_SA_SOURCE_PHONO; // 0x01
-          else if (requested_source == "Aux") source_code = ARCAM_SA_SOURCE_AUX;   // 0x02
-          else if (requested_source == "PVR") source_code = ARCAM_SA_SOURCE_PVR;   // 0x03
-          else if (requested_source == "AV") source_code = ARCAM_SA_SOURCE_AV;     // 0x04
-          else if (requested_source == "STB") source_code = ARCAM_SA_SOURCE_STB;   // 0x05
-          else if (requested_source == "CD") source_code = ARCAM_SA_SOURCE_CD;     // 0x06
-          else if (requested_source == "BD") source_code = ARCAM_SA_SOURCE_BD;     // 0x07
-          else if (requested_source == "SAT") source_code = ARCAM_SA_SOURCE_SAT;   // 0x08
-
-          if (source_code != 0xFF) {
-            ESP_LOGD("set_source_sa", "Sending source code 0x%02X for '%s'", source_code, requested_source.c_str());
-            send_arcam_sa_command("uart_arcam", ARCAM_SA_CMD_SOURCE_SET, {source_code});
-
-            // Optimistic Update
-            ESP_LOGD("set_source_sa", "Optimistically setting source global to '%s'", requested_source.c_str());
-            id(arcam_source_name) = requested_source;
-            id(arcam_source_name).publish_state(requested_source);
-          } else {
-            ESP_LOGW("set_source_sa", "Source '%s' not mapped. No command sent.", requested_source.c_str());
+      #include <string>
+      // Helper needed again in this scope
+      auto get_sa_source_name_from_hex = [](int source_hex) -> std::string {
+          switch (source_hex) {
+              case 0x01: return "PHONO"; case 0x02: return "AUX"; case 0x03: return "PVR";
+              case 0x04: return "AV"; case 0x05: return "STB"; case 0x06: return "CD";
+              case 0x07: return "BD"; case 0x08: return "SAT"; default:   return "Unknown";
           }
+      };
+      return get_sa_source_name_from_hex(id(g_current_source));
+    set_action:
+      - lambda: |-
+          #include <string>
+          #include <vector>
+          #include <map>
+          std::string selected_name = x; // Name selected in HA ("CD", "AUX", etc.)
+          ESP_LOGD("set_action", "Source selected: %s", selected_name.c_str());
+          // Map name back to SA hex code
+          std::map<std::string, uint8_t> name_to_hex = {
+              {"PHONO", 0x01}, {"AUX", 0x02}, {"PVR", 0x03}, {"AV", 0x04},
+              {"STB", 0x05}, {"CD", 0x06}, {"BD", 0x07}, {"SAT", 0x08}
+          };
+          uint8_t source_hex = 0x00; // Default unknown
+          if (name_to_hex.count(selected_name)) {
+              source_hex = name_to_hex[selected_name];
+              id(g_current_source) = source_hex; // Update global optimistically
+              id(source_select).publish_state(selected_name); // Update HA state optimistically
+              ESP_LOGD("set_action", "Source hex 0x%02X determined, prep script.", source_hex);
+          } else {
+              ESP_LOGE("set_action", "Selected source name '%s' not in map.", selected_name.c_str());
+              return; // Stop if invalid name selected
+          }
+      - script.execute:
+          id: send_arcam_command
+          command_data: !lambda 'return std::vector<uint8_t>{0x1D, (uint8_t)id(g_current_source)};' # Direct Source Command
 
-# Optional: Text sensor to display the source name
-text_sensor:
+button:
+  # Use Simulate RC5 IR command (CC=0x08) for menu navigation
   - platform: template
-    name: "Arcam SA Current Source Display" # Renamed slightly
-    id: arcam_sa_current_source_display
-    lambda: |-
-      return id(arcam_source_name).state;
-    update_interval: 15s # Update periodically based on global changes
+    name: "Arcam SA Menu"
+    icon: "mdi:menu"
+    on_press:
+      - script.execute: { id: send_arcam_command, command_data: !lambda 'return std::vector<uint8_t>{0x08, 16, 82};' } # Sys=16, Cmd=82
+  - platform: template
+    name: "Arcam SA OK"
+    icon: "mdi:check-circle-outline"
+    on_press:
+      - script.execute: { id: send_arcam_command, command_data: !lambda 'return std::vector<uint8_t>{0x08, 16, 87};' } # Sys=16, Cmd=87
+  - platform: template
+    name: "Arcam SA Nav Up"
+    icon: "mdi:arrow-up-bold-outline"
+    on_press:
+      - script.execute: { id: send_arcam_command, command_data: !lambda 'return std::vector<uint8_t>{0x08, 16, 86};' } # Sys=16, Cmd=86
+  - platform: template
+    name: "Arcam SA Nav Down"
+    icon: "mdi:arrow-down-bold-outline"
+    on_press:
+      - script.execute: { id: send_arcam_command, command_data: !lambda 'return std::vector<uint8_t>{0x08, 16, 85};' } # Sys=16, Cmd=85
+  - platform: template
+    name: "Arcam SA Nav Left"
+    icon: "mdi:arrow-left-bold-outline"
+    on_press:
+      - script.execute: { id: send_arcam_command, command_data: !lambda 'return std::vector<uint8_t>{0x08, 16, 81};' } # Sys=16, Cmd=81
+  - platform: template
+    name: "Arcam SA Nav Right"
+    icon: "mdi:arrow-right-bold-outline"
+    on_press:
+      - script.execute: { id: send_arcam_command, command_data: !lambda 'return std::vector<uint8_t>{0x08, 16, 80};' } # Sys=16, Cmd=80
